@@ -36,10 +36,13 @@ jobs:
     timeout-minutes: 350  # GitHub's hard cap on standard runners is 360
 
     env:
-      BLENDER_SRC: ${{ github.workspace }}/blender-src
+      BLENDER_SRC: ${{ github.workspace }}
       BUILD_DIR: ${{ github.workspace }}/build_darwin
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Disk usage checkpoint (start)
         run: df -h /
 
@@ -47,9 +50,8 @@ jobs:
         run: |
           brew install autoconf bison dos2unix flex fmt git git-lfs libtool yasm cmake automake nasm
 
-      - name: Clone Blender source
+      - name: Checkout Blender ref and update submodules
         run: |
-          git clone https://projects.blender.org/blender/blender.git "$BLENDER_SRC"
           cd "$BLENDER_SRC"
           git checkout "${{ inputs.blender_ref }}"
           git submodule update --init --recursive || true
