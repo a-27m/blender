@@ -1,0 +1,119 @@
+# .github/workflows/build-macos-intel.yml
+#
+# Builds Blender for Intel macOS from source. This is NOT a normal Blender
+# build: Blender 5.0+ dropped official Intel macOS support, so there is no
+# precompiled lib/macos_x64 package to fetch via `make update`. Instead this
+# pipeline runs `make deps` (compiles the full VFX library stack — OIIO,
+# OSL, OpenVDB, OpenColorIO, etc. — from source) and patches a hardcoded
+# FATAL_ERROR that otherwise blocks the build afterwards.
+#
+# Source for this recipe: https://devtalk.blender.org/t/how-i-built-blender-5-1-on-an-intel-mac/45270
+#
+# OPEN ITEM: OIIO CMAKE_IGNORE_PATH fix below is
+# injected via sed into build_files/build_environment/cmake/openimageio.cmake.
+
+name: Build Blender (macOS Intel, from source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      blender_ref:
+        description: 'Blender branch or tag to build (e.g. blender-v5.1-release, v5.0.1)'
+        required: true
+        default: 'blender-v5.1-release'
+      skip_deps_cache:
+        description: 'Force a full rebuild of the library stack (ignore cache)'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    # Standard, free-for-public-repos Intel runner: 4 vCPU / 14 GB RAM / 14 GB SSD.
+    # 14 GB disk is the main open risk for a full from-source lib stack build —
+    # watch the "Disk usage checkpoint" steps below and be ready to move this
+    # to a paid macos-15-large/macos-26-large runner (more disk) if it fills up.
+    runs-on: macos-15-intel
+    timeout-minutes: 350  # GitHub's hard cap on standard runners is 360
+
+    env:
+      BLENDER_SRC: ${{ github.workspace }}/blender-src
+      BUILD_DIR: ${{ github.workspace }}/build_darwin
+
+    steps:
+      - name: Disk usage checkpoint (start)
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          brew install autoconf bison dos2unix flex fmt git git-lfs libtool yasm cmake automake nasm
+
+      - name: Clone Blender source
+        run: |
+          git clone https://projects.blender.org/blender/blender.git "$BLENDER_SRC"
+          cd "$BLENDER_SRC"
+          git checkout "${{ inputs.blender_ref }}"
+          git submodule update --init --recursive || true
+
+      - name: Cache compiled library stack (lib/macos_x64)
+        if: ${{ !inputs.skip_deps_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BLENDER_SRC }}/lib/macos_x64
+          key: blender-deps-macos_x64-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}
+
+      - name: Build library dependencies from source (make deps)
+        run: |
+          cd "$BLENDER_SRC"
+          make deps
+
+      - name: Disk usage checkpoint (after make deps)
+        run: df -h /
+
+      # - name: Prune deps build intermediates (keep only installed libs)
+      #   run: |
+      #     # make deps leaves packages/ and build/ trees behind after installing
+      #     # into lib/macos_x64 — these aren't needed for the Blender build itself.
+      #     rm -rf "$BUILD_DIR/deps_x64/build" "$BUILD_DIR/deps_x64/packages" || true
+      #     df -h /
+
+      - name: Patch hardcoded Intel-lib FATAL_ERROR to a warning
+        run: |
+          cd "$BLENDER_SRC"
+          FILE=build_files/cmake/platform/platform_apple.cmake
+          sed -i '' \
+            's|message(FATAL_ERROR "Mac OSX requires pre-compiled libs at: .\${LIBDIR}.")|message(WARNING "Pre-compiled libs at ${LIBDIR} are not a git repository — expected when built via make deps.")|' \
+            "$FILE"
+
+      - name: Build Blender
+        run: |
+          cd "$BLENDER_SRC"
+          make
+
+      - name: Package .dmg
+        run: |
+          cd "$BUILD_DIR"
+          APP_PATH=$(find bin -maxdepth 1 -name "*.app" | head -n1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found in build_darwin/bin — build likely failed silently."
+            exit 1
+          fi
+          VOL_NAME="Blender-${{ inputs.blender_ref }}-macos-intel"
+          hdiutil create -volname "$VOL_NAME" -srcfolder "$APP_PATH" -ov -format UDZO "${VOL_NAME}.dmg"
+
+      - name: Disk usage checkpoint (end)
+        run: df -h /
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-macos-intel-${{ inputs.blender_ref }}
+          path: ${{ env.BUILD_DIR }}/*.dmg
+          # retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.blender_ref }}
+          path: ${{ env.BLENDER_SRC }}/build_darwin/**/*.log
+          retention-days: 7
