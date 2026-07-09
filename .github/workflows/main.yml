@@ -66,7 +66,7 @@ jobs:
       - name: Build library dependencies from source (make deps)
         run: |
           cd "$BLENDER_SRC"
-          make deps
+          CMAKE_POLICY_VERSION_MINIMUM=3.5 make deps
 
       - name: Disk usage checkpoint (after make deps)
         run: df -h /
