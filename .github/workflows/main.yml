@@ -9,8 +9,6 @@
 #
 # Source for this recipe: https://devtalk.blender.org/t/how-i-built-blender-5-1-on-an-intel-mac/45270
 #
-# OPEN ITEM: OIIO CMAKE_IGNORE_PATH fix below is
-# injected via sed into build_files/build_environment/cmake/openimageio.cmake.
 
 name: Build Blender (macOS Intel, from source)
 
@@ -28,10 +26,6 @@ on:
 
 jobs:
   build:
-    # Standard, free-for-public-repos Intel runner: 4 vCPU / 14 GB RAM / 14 GB SSD.
-    # 14 GB disk is the main open risk for a full from-source lib stack build —
-    # watch the "Disk usage checkpoint" steps below and be ready to move this
-    # to a paid macos-15-large/macos-26-large runner (more disk) if it fills up.
     runs-on: macos-15-intel
     timeout-minutes: 350  # GitHub's hard cap on standard runners is 360
 
@@ -48,7 +42,28 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install autoconf bison dos2unix flex fmt git git-lfs libtool yasm cmake automake nasm
+          brew install autoconf bison dos2unix flex fmt git git-lfs libtool yasm automake nasm
+
+
+      # --- CMP0042-class fix: pin CMake to the last 3.x release ------------
+      # CMake 4.x removed OLD-policy support for a batch of legacy policies
+      # (CMP0042 among them) — confirmed independently by a Homebrew
+      # discussion of people hitting the same breakage after the 4.0.0 jump.
+      # Several of Blender's vendored deps still call
+      # cmake_policy(SET CMP0042 OLD) explicitly, which is now a hard error
+      # rather than a warning. Pinning to 3.31.x sidesteps the whole class
+      # of error instead of patching each dependency as it surfaces.
+      - name: Install pinned CMake 3.31.x
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.x'
+          # Uses the workflow's own GITHUB_TOKEN automatically to query the
+          # release API — no extra secret needed, avoids anonymous rate limits.
+
+      - name: Confirm pinned CMake is first on PATH
+        run: |
+          which cmake
+          cmake --version   # must print 3.31.x, not whatever the runner image ships
 
       - name: Checkout Blender ref and update submodules
         run: |
@@ -56,27 +71,40 @@ jobs:
           git checkout "${{ inputs.blender_ref }}"
           git submodule update --init --recursive || true
 
-      - name: Cache compiled library stack (lib/macos_x64)
+      # Cache entries are immutable per key, and actions/cache@v4 skips the
+      # save step by default when the job fails. Using a run_id-suffixed key
+      # for every success or failure, restore-keys prefix-matches to the most
+      # recent one
+      - name: Restore most recent deps build state (partial or complete)
         if: ${{ !inputs.skip_deps_cache }}
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: ${{ env.BLENDER_SRC }}/lib/macos_x64
-          key: blender-deps-macos_x64-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}
+          path: |
+            ${{ env.BUILD_DIR }}/deps_x64
+            ${{ env.BLENDER_SRC }}/lib/macos_x64
+          key: deps-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+          restore-keys: |
+            deps-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}-
 
       - name: Build library dependencies from source (make deps)
         run: |
           cd "$BLENDER_SRC"
-          CMAKE_POLICY_VERSION_MINIMUM=3.5 make deps
+          make deps
 
       - name: Disk usage checkpoint (after make deps)
         run: df -h /
 
-      # - name: Prune deps build intermediates (keep only installed libs)
-      #   run: |
-      #     # make deps leaves packages/ and build/ trees behind after installing
-      #     # into lib/macos_x64 — these aren't needed for the Blender build itself.
-      #     rm -rf "$BUILD_DIR/deps_x64/build" "$BUILD_DIR/deps_x64/packages" || true
-      #     df -h /
+      # Always save, even on failure — this is what makes retries resumable
+      # instead of restarting the ~40-library stack from zero each time.
+      - name: Save deps build state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.BUILD_DIR }}/deps_x64
+            ${{ env.BLENDER_SRC }}/lib/macos_x64
+          key: deps-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}-${{ github.run_id }}
+
 
       - name: Patch hardcoded Intel-lib FATAL_ERROR to a warning
         run: |
@@ -119,3 +147,15 @@ jobs:
           name: build-log-${{ inputs.blender_ref }}
           path: ${{ env.BLENDER_SRC }}/build_darwin/**/*.log
           retention-days: 7
+
+      # Once a build fully succeeds, older run-scoped deps cache entries for
+      # this ref+version-hash from failed partial builds no longer needed
+      - name: Clean up superseded deps cache entries
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREFIX="deps-${{ inputs.blender_ref }}-${{ hashFiles('blender-src/build_files/build_environment/cmake/versions.cmake') }}-"
+          gh cache list --key "$PREFIX" --json id,key,createdAt \
+            | jq -r 'sort_by(.createdAt) | .[:-1][].id' \
+            | xargs -I{} gh cache delete {} || true
